@@ -1,0 +1,1310 @@
+/**
+ * @file Dmp.cpp
+ * @brief  Dmp class source file.
+ * @author Freek Stulp
+ *
+ * This file is part of DmpBbo, a set of libraries and programs for the 
+ * black-box optimization of dynamical movement primitives.
+ * Copyright (C) 2014 Freek Stulp, ENSTA-ParisTech
+ * 
+ * DmpBbo is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Lesser General Public License as published by
+ * the Free Software Foundation, either version 2 of the License, or
+ * (at your option) any later version.
+ * 
+ * DmpBbo is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Lesser General Public License for more details.
+ * 
+ * You should have received a copy of the GNU Lesser General Public License
+ * along with DmpBbo.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+#include <boost/serialization/export.hpp>
+#include <boost/serialization/vector.hpp>
+#include <boost/archive/text_iarchive.hpp>
+#include <boost/archive/text_oarchive.hpp>
+#include <boost/archive/xml_iarchive.hpp>
+#include <boost/archive/xml_oarchive.hpp>
+#include "/home/hrcstudents/Documents/dmpbbo_ws/src/predictable_kuka_v1/include/dmp_bbo_node/Dmp.hpp"
+
+/** For boost::serialization. See http://www.boost.org/doc/libs/1_55_0/libs/serialization/doc/special.html#export */
+BOOST_CLASS_EXPORT_IMPLEMENT(DmpBbo::Dmp);
+
+#include <cmath>
+#include <iostream>
+#include <fstream>
+#include <string>
+#include <eigen3/Eigen/Core>
+
+#include "/home/hrcstudents/Documents/Code/catkin_ws/src/dmp_bbo_node/include/dmp_bbo_node/Trajectory.hpp"
+#include "/home/hrcstudents/Documents/Code/catkin_ws/src/dmp_bbo_node/include/dmp_bbo_node/FunctionApproximator.hpp"
+#include "/home/hrcstudents/Documents/Code/catkin_ws/src/dmp_bbo_node/include/dmp_bbo_node/SpringDamperSystem.hpp"
+#include "/home/hrcstudents/Documents/Code/catkin_ws/src/dmp_bbo_node/include/dmp_bbo_node/ExponentialSystem.hpp"
+#include "/home/hrcstudents/Documents/Code/catkin_ws/src/dmp_bbo_node/include/dmp_bbo_node/TimeSystem.hpp"
+#include "/home/hrcstudents/Documents/Code/catkin_ws/src/dmp_bbo_node/include/dmp_bbo_node/SigmoidSystem.hpp"
+
+#include "/home/hrcstudents/Documents/Code/catkin_ws/src/dmp_bbo_node/include/dmp_bbo_node/EigenBoostSerialization.hpp"
+#include "/home/hrcstudents/Documents/Code/catkin_ws/src/dmp_bbo_node/include/dmp_bbo_node/BoostSerializationToString.hpp"
+#include <eigen3/Eigen/Geometry>
+
+using namespace std;
+using namespace Eigen;
+
+namespace DmpBbo {
+
+/** Extracts all variables of the spring-damper system from a state vector, e.g. state.SPRING */ 
+#define SPRING    segment(0*dim_orig()+0,2*dim_orig())
+/** Extracts first order variables of the spring-damper system from a state vector, e.g. state.SPRINGM_Y */ 
+#define SPRING_Y  segment(0*dim_orig()+0,dim_orig())
+/** Extracts second order variables of the spring-damper system from a state vector, e.g. state.SPRING_Z */ 
+#define SPRING_Z  segment(1*dim_orig()+0,dim_orig())
+/** Extracts all variables of the goal from a state vector, e.g. state.GOAL */ 
+#define GOAL      segment(2*dim_orig()+0,dim_orig())
+/** Extracts the phase variable (1-D) from a state vector, e.g. state.PHASE */ 
+#define PHASE     segment(3*dim_orig()+0,       1)
+/** Extracts all variables of the gating system from a state vector, e.g. state.GATING */ 
+#define GATING    segment(3*dim_orig()+1,       1)
+
+/** Extracts first T (time steps) state vectors of the spring-damper system , e.g. states.SPRING(100) */ 
+#define SPRINGM(T)    block(0,0*dim_orig()+0,T,2*dim_orig())
+/** Extracts first T (time steps) state vectors of the spring-damper system , e.g. states.SPRINGM_Y(100) */ 
+#define SPRINGM_Y(T)  block(0,0*dim_orig()+0,T,dim_orig())
+/** Extracts first T (time steps) state vectors of the spring-damper system , e.g. states.SPRINGM_Z(100) */ 
+#define SPRINGM_Z(T)  block(0,1*dim_orig()+0,T,dim_orig())
+/** Extracts first T (time steps) state vectors of the goal system, e.g. states.GOALM(100) */ 
+#define GOALM(T)      block(0,2*dim_orig()+0,T,dim_orig())
+/** Extracts first T (time steps) states of the phase system, e.g. states.PHASEM(100) */ 
+#define PHASEM(T)     block(0,3*dim_orig()+0,T,       1)
+/** Extracts first T (time steps) state vectors of the gating system, e.g. states.GATINGM(100) */ 
+#define GATINGM(T)    block(0,3*dim_orig()+1,T,       1)
+
+boost::mt19937 Dmp::rng = boost::mt19937(getpid() + time(0));
+
+
+
+Dmp::Dmp(double tau, Eigen::VectorXd y_init, Eigen::VectorXd y_attr, 
+         std::vector<FunctionApproximator*> function_approximators,
+         double alpha_spring_damper, 
+         DynamicalSystem* goal_system,
+         DynamicalSystem* phase_system, 
+         DynamicalSystem* gating_system)
+  : DynamicalSystem(1, tau, y_init, y_attr, "name"),
+  goal_system_(goal_system),
+  phase_system_(phase_system), gating_system_(gating_system) 
+{
+  initSubSystems(alpha_spring_damper, goal_system, phase_system, gating_system);
+  initFunctionApproximators(function_approximators);
+}
+
+  
+Dmp::Dmp(int n_dims_dmp, std::vector<FunctionApproximator*> function_approximators, 
+   double alpha_spring_damper, DynamicalSystem* goal_system,
+   DynamicalSystem* phase_system, DynamicalSystem* gating_system)
+  : DynamicalSystem(1, 1.0, VectorXd::Zero(n_dims_dmp), VectorXd::Ones(n_dims_dmp), "name"),
+  goal_system_(goal_system),
+  phase_system_(phase_system), gating_system_(gating_system), function_approximators_(function_approximators)
+{
+  initSubSystems(alpha_spring_damper, goal_system, phase_system, gating_system);
+  initFunctionApproximators(function_approximators);
+}
+    
+Dmp::Dmp(double tau, Eigen::VectorXd y_init, Eigen::VectorXd y_attr, 
+         std::vector<FunctionApproximator*> function_approximators, 
+         DmpType dmp_type)
+  : DynamicalSystem(1, tau, y_init, y_attr, "name")
+{  
+  initSubSystems(dmp_type);
+  initFunctionApproximators(function_approximators);
+}
+  
+Dmp::Dmp(int n_dims_dmp, 
+         std::vector<FunctionApproximator*> function_approximators, 
+         DmpType dmp_type)
+  : DynamicalSystem(1, 1.0, VectorXd::Zero(n_dims_dmp), VectorXd::Ones(n_dims_dmp),
+   "name")
+{
+  initSubSystems(dmp_type);
+  initFunctionApproximators(function_approximators);
+}
+
+Dmp::Dmp(double tau, Eigen::VectorXd y_init, Eigen::VectorXd y_attr, double alpha_spring_damper, DynamicalSystem* goal_system) 
+  : DynamicalSystem(1, tau, y_init, y_attr, "name")
+{
+  
+  VectorXd one_1 = VectorXd::Ones(1);
+  VectorXd one_0 = VectorXd::Zero(1);
+  DynamicalSystem* phase_system  = new ExponentialSystem(tau,one_1,one_0,4);
+  DynamicalSystem* gating_system = new ExponentialSystem(tau,one_1,one_0,4); 
+  initSubSystems(alpha_spring_damper, goal_system, phase_system, gating_system);
+
+  vector<FunctionApproximator*> function_approximators(y_init.size());    
+  for (int dd=0; dd<y_init.size(); dd++)
+    function_approximators[dd] = NULL;
+  initFunctionApproximators(function_approximators);  
+}
+
+void Dmp::initSubSystems(DmpType dmp_type)
+{
+  VectorXd one_1 = VectorXd::Ones(1);
+  VectorXd one_0 = VectorXd::Zero(1);
+  
+  DynamicalSystem *goal_system=NULL;
+  DynamicalSystem *phase_system=NULL;
+  DynamicalSystem *gating_system=NULL;
+  if (dmp_type==IJSPEERT_2002_MOVEMENT)
+  {
+    goal_system   = NULL;
+    phase_system  = new ExponentialSystem(tau(),one_1,one_0,4);
+    gating_system = new ExponentialSystem(tau(),one_1,one_0,4); 
+  }                                                          
+  else if (dmp_type==KULVICIUS_2012_JOINING || dmp_type==COUNTDOWN_2013)
+  {
+    goal_system   = new ExponentialSystem(tau(),initial_state(),attractor_state(),15);
+    gating_system = new SigmoidSystem(tau(),one_1,-20,0.9*tau()); 
+    bool count_down = (dmp_type==COUNTDOWN_2013);    
+    phase_system  = new TimeSystem(tau(),count_down);
+  }
+  
+  double alpha_spring_damper = 20;
+  
+  initSubSystems(alpha_spring_damper, goal_system, phase_system, gating_system);
+}
+
+void Dmp::initSubSystems(double alpha_spring_damper, DynamicalSystem* goal_system,
+  DynamicalSystem* phase_system, DynamicalSystem* gating_system)
+{
+
+  // Make room for the subsystems
+  set_dim(3*dim_orig()+2);
+    
+  spring_system_ = new SpringDamperSystem(tau(),initial_state(),attractor_state(),alpha_spring_damper);  
+  spring_system_->set_name(name()+"_spring-damper");
+  analytical_solution_perturber_ = NULL; // Do not perturb spring-damper as default
+
+  goal_system_ = goal_system;
+  if (goal_system!=NULL)
+  {
+    assert(goal_system->dim()==dim_orig());
+    // Initial state of the goal system is that same as that of the DMP
+    goal_system_->set_initial_state(initial_state());
+    goal_system_->set_name(name()+"_goal");
+  }
+
+  phase_system_ = phase_system;
+  phase_system_->set_name(name()+"_phase");
+
+  gating_system_ = gating_system;
+  gating_system_->set_name(name()+"_gating");
+
+}
+
+void Dmp::set_damping_coefficient(double damping_coefficient)
+{
+  spring_system_->set_damping_coefficient(damping_coefficient); 
+}
+void Dmp::set_spring_constant(double spring_constant) {
+  spring_system_->set_spring_constant(spring_constant); 
+}
+  
+
+void Dmp::initFunctionApproximators(vector<FunctionApproximator*> function_approximators)
+{
+  if (function_approximators.empty())
+    return;
+  
+  assert(dim_orig()==(int)function_approximators.size());
+  
+  function_approximators_ = vector<FunctionApproximator*>(function_approximators.size());
+  for (unsigned int dd=0; dd<function_approximators.size(); dd++)
+  {
+    if (function_approximators[dd]==NULL)
+      function_approximators_[dd] = NULL;
+    else
+      function_approximators_[dd] = function_approximators[dd]->clone();
+  }
+
+}
+
+Dmp::~Dmp(void)
+{
+  delete goal_system_;   
+  delete spring_system_;
+  delete phase_system_;
+  delete gating_system_;
+  for (unsigned int ff=0; ff<function_approximators_.size(); ff++)
+    delete (function_approximators_[ff]);
+}
+
+Dmp* Dmp::clone(void) const {
+  vector<FunctionApproximator*> function_approximators;
+  for (unsigned int ff=0; ff<function_approximators_.size(); ff++)
+    function_approximators.push_back(function_approximators_[ff]->clone());
+  
+  return new Dmp(tau(), initial_state(), attractor_state(), function_approximators,
+   spring_system_->damping_coefficient(), goal_system_->clone(),
+   phase_system_->clone(), gating_system_->clone());
+}
+
+
+void Dmp::integrateStart(Ref<VectorXd> x, Ref<VectorXd> xd) const
+{
+  assert(x.size()==dim());
+  assert(xd.size()==dim());
+  
+  x.fill(0);  
+  xd.fill(0);  
+  
+  // Start integrating goal system if it exists
+  if (goal_system_==NULL)
+  {
+    // No goal system, simply set goal state to attractor state
+    x.GOAL = attractor_state();
+    xd.GOAL.fill(0);
+  }
+  else
+  {
+    // Goal system exists. Start integrating it.
+    goal_system_->integrateStart(x.GOAL,xd.GOAL);
+  }
+  
+    
+  // Set the attractor state of the spring system
+  spring_system_->set_attractor_state(x.GOAL);
+  
+  // Start integrating all futher subsystems
+  spring_system_->integrateStart(x.SPRING, xd.SPRING);
+  phase_system_->integrateStart(  x.PHASE,  xd.PHASE);
+  gating_system_->integrateStart(x.GATING, xd.GATING);
+
+  // Add rates of change
+  differentialEquation(x,xd);
+  
+}
+
+/*
+bool Dmp::isTrained(void) const
+{
+  for (int i_dim=0; i_dim<dim_orig(); i_dim++)
+    if (function_approximators_[i_dim]!=NULL)
+      return false;
+    
+  for (int i_dim=0; i_dim<dim_orig(); i_dim++)
+    if (function_approximators_[i_dim]->isTrained()) 
+      return false;
+    
+  return true;
+}
+*/
+
+void Dmp::computeFunctionApproximatorOutput(const MatrixXd& phase_state, MatrixXd& fa_output) const
+{
+  int T = phase_state.rows();
+  fa_output.resize(T,dim_orig());
+  fa_output.fill(0.0);
+  
+  MatrixXd output(T,1);
+  for (int i_dim=0; i_dim<dim_orig(); i_dim++)
+  {
+    if (function_approximators_[i_dim]!=NULL)
+    {
+      if (function_approximators_[i_dim]->isTrained()) 
+      {
+        function_approximators_[i_dim]->predict(phase_state,output);
+        fa_output.col(i_dim) = output;
+      }
+    }
+  }
+}
+
+void Dmp::differentialEquation(const VectorXd& x, Ref<VectorXd> xd) const
+{
+  
+  if (goal_system_==NULL)
+  {
+    // If there is no dynamical system for the delayed goal, the goal is
+    // simply the attractor state
+    spring_system_->set_attractor_state(attractor_state());
+    // with zero change
+    xd.GOAL.fill(0);
+  } 
+  else
+  {
+    // Integrate goal system and get current goal state
+    goal_system_->set_attractor_state(attractor_state());
+    goal_system_->differentialEquation(x.GOAL, xd.GOAL);
+    // The goal state is the attractor state of the spring-damper system
+    spring_system_->set_attractor_state(x.GOAL);
+        
+  }
+
+  // Integrate spring damper system
+  // Forcing term is added to spring_state later
+  spring_system_->differentialEquation(x.SPRING, xd.SPRING);
+
+  
+  // Non-linear forcing term
+  phase_system_->differentialEquation(x.PHASE, xd.PHASE);
+  gating_system_->differentialEquation(x.GATING, xd.GATING);
+
+  MatrixXd phase_state(1,1);
+  phase_state = x.PHASE;
+  MatrixXd fa_output(1,dim_orig());
+  computeFunctionApproximatorOutput(phase_state, fa_output); 
+  
+  int t0 = 0;
+  double gating = (x.GATING)[0];
+  VectorXd g_minus_y0 = (attractor_state()-initial_state()).transpose();
+  VectorXd forcing_term = gating*fa_output.row(t0); // todo .array()*g_minus_y0.array();
+
+  // Add forcing term to the ZD component of the spring state
+  xd.SPRING_Z = xd.SPRING_Z + forcing_term/tau();
+
+
+}
+
+void Dmp::statesAsTrajectory(const Eigen::MatrixXd& x_in, const Eigen::MatrixXd& xd_in, Eigen::MatrixXd& y_out, Eigen::MatrixXd& yd_out, Eigen::MatrixXd& ydd_out) const
+{
+  int n_time_steps = x_in.rows(); 
+  y_out  = x_in.SPRINGM_Y(n_time_steps);
+  yd_out = xd_in.SPRINGM_Y(n_time_steps);
+  ydd_out = xd_in.SPRINGM_Z(n_time_steps)/tau();
+  // MatrixXd z_out, zd_out;
+  // z_out  = x_in.SPRINGM_Z(n_time_steps);
+  // zd_out = xd_in.SPRINGM_Z(n_time_steps);
+  // Divide by tau to go from z to y space
+  // yd = z_out/obj.tau;
+  // ydd_out = zd_out/tau();
+}
+
+
+void Dmp::statesAsTrajectory(const Eigen::VectorXd& ts, const Eigen::MatrixXd& x_in, const Eigen::MatrixXd& xd_in, Trajectory& trajectory) const {
+  int n_time_steps = ts.rows();
+#ifndef NDEBUG // Variables below are only required for asserts; check for NDEBUG to avoid warnings.
+  int n_dims       = x_in.cols();
+#endif
+  assert(n_time_steps==x_in.rows());
+  assert(n_time_steps==xd_in.rows());
+  assert(n_dims==xd_in.cols());
+
+  // Left column is time
+  Trajectory new_trajectory(
+    ts,
+    // y_out (see function above)
+    x_in.SPRINGM_Y(n_time_steps),
+    // yd_out (see function above)
+    xd_in.SPRINGM_Y(n_time_steps),
+    // ydd_out (see function above)
+    xd_in.SPRINGM_Z(n_time_steps)/tau()
+  );
+  
+  trajectory = new_trajectory;
+  
+}
+
+void Dmp::analyticalSolution(const Eigen::VectorXd& ts, Eigen::MatrixXd& xs, Eigen::MatrixXd& xds, Eigen::MatrixXd& forcing_terms, Eigen::MatrixXd& fa_outputs, double avoidNum) const
+{
+  int n_time_steps = ts.size();
+  assert(n_time_steps>0);
+  
+  // Usually, we expect xs and xds to be of size T X dim(), so we resize to that. However, if the
+  // input matrices were of size dim() X T, we return the matrices of that size by doing a 
+  // transposeInPlace at the end. That way, the user can also request dim() X T sized matrices.
+  bool caller_expects_transposed = (xs.rows()==dim() && xs.cols()==n_time_steps);
+  
+  // INTEGRATE SYSTEMS ANALYTICALLY AS MUCH AS POSSIBLE
+
+  // Integrate phase
+  MatrixXd xs_phase;
+  MatrixXd xds_phase;
+  phase_system_->analyticalSolution(ts,xs_phase,xds_phase);
+  
+  // Compute gating term
+  MatrixXd xs_gating;
+  MatrixXd xds_gating;
+  MatrixXd test(xds.rows(),xds.cols()) ;
+
+  test.fill(avoidNum);
+  
+  gating_system_->analyticalSolution(ts,xs_gating,xds_gating);
+
+  // Compute the output of the function approximator
+  fa_outputs.resize(ts.size(),dim_orig());
+  fa_outputs.fill(0.0);
+  //if (isTrained())
+  computeFunctionApproximatorOutput(xs_phase, fa_outputs);
+
+  MatrixXd xs_gating_rep = xs_gating.replicate(1,fa_outputs.cols());
+  MatrixXd g_minus_y0_rep = (attractor_state()-initial_state()).transpose().replicate(n_time_steps,1);
+
+  forcing_terms = fa_outputs.array()*xs_gating_rep.array(); // todo *g_minus_y0_rep.array(); 
+  
+  MatrixXd xs_goal, xds_goal;
+  // Get current delayed goal
+  if (goal_system_==NULL)
+  {
+    // If there is no dynamical system for the delayed goal, the goal is
+    // simply the attractor state               
+    xs_goal  = attractor_state().transpose().replicate(n_time_steps,1);
+    // with zero change
+    xds_goal = MatrixXd::Zero(n_time_steps,dim_orig());
+  } 
+  else
+  {
+    // Integrate goal system and get current goal state
+    goal_system_->analyticalSolution(ts,xs_goal,xds_goal);
+  }
+
+  xs.resize(n_time_steps,dim());
+  xds.resize(n_time_steps,dim());
+
+  int T = n_time_steps;
+    
+  xs.GOALM(T) = xs_goal;     xds.GOALM(T) = xds_goal;
+  xs.PHASEM(T) = xs_phase;   xds.PHASEM(T) = xds_phase;
+  xs.GATINGM(T) = xs_gating; xds.GATINGM(T) = xds_gating;
+
+  
+  // THE REST CANNOT BE DONE ANALYTICALLY
+  
+  // Reset the dynamical system, and get the first state
+  double damping = spring_system_->damping_coefficient();
+  SpringDamperSystem localspring_system_(tau(),initial_state(),attractor_state(),damping);
+  
+  // Set first attractor state
+  localspring_system_.set_attractor_state(xs_goal.row(0));
+  
+  // Start integrating spring damper system
+  int dim_spring = localspring_system_.dim();
+  VectorXd x_spring(dim_spring), xd_spring(dim_spring); // todo Why are these needed?
+  int t0 = 0;
+  localspring_system_.integrateStart(x_spring, xd_spring);
+  xs.row(t0).SPRING  = x_spring;
+  xds.row(t0).SPRING = xd_spring;
+
+  // Add forcing term to the acceleration of the spring state  
+  xds.SPRINGM_Z(1) = xds.SPRINGM_Z(1) + forcing_terms.row(t0)/tau();
+
+
+  
+
+  for (int tt=1; tt<n_time_steps; tt++)
+  {
+    double dt = ts[tt]-ts[tt-1];
+    
+    // Euler integration
+    xs.row(tt).SPRING  = xs.row(tt-1).SPRING + dt*xds.row(tt-1).SPRING;
+  
+    // Set the attractor state of the spring system
+    localspring_system_.set_attractor_state(xs.row(tt).GOAL);
+
+    // Integrate spring damper system
+    localspring_system_.differentialEquation(xs.row(tt).SPRING, xd_spring);
+    xds.row(tt).SPRING = xd_spring;
+    
+    // If necessary add a perturbation. May be useful for some off-line tests.
+    RowVectorXd perturbation = RowVectorXd::Constant(dim_orig(),0.0);
+    if (analytical_solution_perturber_!=NULL)
+      for (int i_dim=0; i_dim<dim_orig(); i_dim++)
+        // Sample perturbation from a normal Gaussian distribution
+        perturbation(i_dim) = (*analytical_solution_perturber_)();
+      
+    // Add forcing term to the acceleration of the spring state 
+
+
+    xds.row(tt).SPRING_Z = xds.row(tt).SPRING_Z + forcing_terms.row(tt)/tau() + perturbation + avoidNum*(forcing_terms.row(tt)/tau()) ;
+    //test.row(tt).SPRING_Z ; 
+  } 
+  
+  if (caller_expects_transposed)
+  {
+    xs.transposeInPlace();
+    xds.transposeInPlace();
+  }
+
+
+  std::cout<<xds.row(0).SPRING_Z<<endl ;
+  std::cout<<xds.row(5).SPRING_Z<<endl ;
+  std::cout<<xds.row(50).SPRING_Z<<endl ;
+  std::cout<<xds.row(n_time_steps-1).SPRING_Z<<endl ;
+  std::cout<<test.row(5).SPRING_Z<<endl ;
+}
+
+
+
+void Dmp::analyticalSolution(const Eigen::VectorXd& ts, Eigen::MatrixXd& xs, Eigen::MatrixXd& xds, Eigen::MatrixXd& forcing_terms, Eigen::MatrixXd& fa_outputs) const
+{
+  int n_time_steps = ts.size();
+  assert(n_time_steps>0);
+  
+  // Usually, we expect xs and xds to be of size T X dim(), so we resize to that. However, if the
+  // input matrices were of size dim() X T, we return the matrices of that size by doing a 
+  // transposeInPlace at the end. That way, the user can also request dim() X T sized matrices.
+  bool caller_expects_transposed = (xs.rows()==dim() && xs.cols()==n_time_steps);
+  
+  // INTEGRATE SYSTEMS ANALYTICALLY AS MUCH AS POSSIBLE
+
+  // Integrate phase
+  MatrixXd xs_phase;
+  MatrixXd xds_phase;
+  phase_system_->analyticalSolution(ts,xs_phase,xds_phase);
+  
+  // Compute gating term
+  MatrixXd xs_gating;
+  MatrixXd xds_gating;
+  gating_system_->analyticalSolution(ts,xs_gating,xds_gating);
+
+  // Compute the output of the function approximator
+  fa_outputs.resize(ts.size(),dim_orig());
+  fa_outputs.fill(0.0);
+  //if (isTrained())
+  computeFunctionApproximatorOutput(xs_phase, fa_outputs);
+
+  MatrixXd xs_gating_rep = xs_gating.replicate(1,fa_outputs.cols());
+  MatrixXd g_minus_y0_rep = (attractor_state()-initial_state()).transpose().replicate(n_time_steps,1);
+
+  forcing_terms = fa_outputs.array()*xs_gating_rep.array(); // todo *g_minus_y0_rep.array(); 
+  
+  MatrixXd xs_goal, xds_goal;
+  // Get current delayed goal
+  if (goal_system_==NULL)
+  {
+
+    // If there is no dynamical system for the delayed goal, the goal is
+    // simply the attractor state               
+    xs_goal  = attractor_state().transpose().replicate(n_time_steps,1);
+    // with zero change
+    xds_goal = MatrixXd::Zero(n_time_steps,dim_orig());
+  } 
+  else
+  {
+
+    // Integrate goal system and get current goal state
+    goal_system_->analyticalSolution(ts,xs_goal,xds_goal);
+  }
+
+  xs.resize(n_time_steps,dim());
+  xds.resize(n_time_steps,dim());
+
+  int T = n_time_steps;
+    
+  xs.GOALM(T) = xs_goal;     xds.GOALM(T) = xds_goal;
+  xs.PHASEM(T) = xs_phase;   xds.PHASEM(T) = xds_phase;
+  xs.GATINGM(T) = xs_gating; xds.GATINGM(T) = xds_gating;
+
+  
+  // THE REST CANNOT BE DONE ANALYTICALLY
+  
+  // Reset the dynamical system, and get the first state
+  double damping = spring_system_->damping_coefficient();
+  SpringDamperSystem localspring_system_(tau(),initial_state(),attractor_state(),damping);
+  
+  // Set first attractor state
+  localspring_system_.set_attractor_state(xs_goal.row(0));
+  
+  // Start integrating spring damper system
+  int dim_spring = localspring_system_.dim();
+  VectorXd x_spring(dim_spring), xd_spring(dim_spring); // todo Why are these needed?
+  int t0 = 0;
+  localspring_system_.integrateStart(x_spring, xd_spring);
+  xs.row(t0).SPRING  = x_spring;
+  xds.row(t0).SPRING = xd_spring;
+
+  // Add forcing term to the acceleration of the spring state  
+  xds.SPRINGM_Z(1) = xds.SPRINGM_Z(1) + forcing_terms.row(t0)/tau();
+  
+  for (int tt=1; tt<n_time_steps; tt++)
+  {
+    double dt = ts[tt]-ts[tt-1];
+
+    // Euler integration
+    xs.row(tt).SPRING  = xs.row(tt-1).SPRING + dt*xds.row(tt-1).SPRING;
+
+    // Set the attractor state of the spring system
+    localspring_system_.set_attractor_state(xs.row(tt).GOAL);
+
+    // Integrate spring damper system
+    localspring_system_.differentialEquation(xs.row(tt).SPRING, xd_spring);
+    xds.row(tt).SPRING = xd_spring;
+
+    // If necessary add a perturbation. May be useful for some off-line tests.
+    RowVectorXd perturbation = RowVectorXd::Constant(dim_orig(),0.0);
+    if (analytical_solution_perturber_!=NULL) {
+
+      for (int i_dim=0; i_dim<dim_orig(); i_dim++) {
+        // Sample perturbation from a normal Gaussian distribution
+
+        perturbation(i_dim) = (*analytical_solution_perturber_)();
+
+      }
+    }
+    // Add forcing term to the acceleration of the spring state
+    xds.row(tt).SPRING_Z = xds.row(tt).SPRING_Z + forcing_terms.row(tt)/tau() + perturbation;
+
+    // Compute y component from z
+    xds.row(tt).SPRING_Y = xs.row(tt).SPRING_Z/tau();
+
+  } 
+  
+  if (caller_expects_transposed)
+  {
+    xs.transposeInPlace();
+    xds.transposeInPlace();
+  }
+ 
+  }
+
+
+
+// SARA -- Code additions
+
+//void Dmp::avoidObstacles(const Eigen::VectorXd& ts, Eigen::MatrixXd& xs, Eigen::MatrixXd& xds, Eigen::MatrixXd& obstacles, Eigen::MatrixXd& obstacles_forcing_term) const
+void Dmp::avoidObstacles(const Eigen::VectorXd& ts, const Eigen::MatrixXd& xs, const Eigen::MatrixXd& xds, Eigen::MatrixXd& obstacles, Eigen::MatrixXd& obstacles_forcing_term) const
+{
+
+  const double PI = 3.141592653589793238463;
+
+  int n_dims = xs.cols();
+
+  double beta = 20.0/PI;
+  double gamma = 1000;
+
+  int n_time_steps = ts.size();
+  int n_rows_obstacles = obstacles.rows();
+  obstacles_forcing_term = MatrixXd::Zero(n_time_steps,n_dims);
+
+  // -------- Compute obstacle avoidance term --------
+  // Obstacle avoidance term: R * dy * d_phi, where
+  //    R = (obstacle to current position axis) x (dy rotated 90°)
+  //    d_phi = gamma * phi * exp(-beta*abs(phi))
+  //    Full explanation at: https://studywolf.wordpress.com/2016/05/13/dynamic-movement-primitives-part-4-avoiding-obstacles/
+
+  // Obstacle matrix
+  // For every obstacle there is a row with the obstacle position on each dimension
+  // y_t0_1 y_t0_2  ... y_t0_D
+  // y_t1_1 y_t1_2  ... y_t1_D
+  // ...
+  // y_tj_1 y_tj_2  ... y_tj_D
+
+  // Obstacles forcing term is a n_time_steps x n_dimensions matrix with the sum of forcing terms for every obstacle at each time step
+  // Each contribution is calculated as p = (RotationMatrix·([t_obs-t,y_obs-y] x [t,yd]))· [t,yd] · d_phi
+
+  ArrayXd p;
+  RowVector3d Rv, resized_goal_pos, current_position, obstacle_position, position_to_obstacle_vector, velocity_vector, r, r_norm;
+  double phi;
+  double d_phi = 0;
+
+  if(n_dims < 2 || n_dims > 3)
+  {
+    cout << "WARNING: Obstacle avoidance is not implemented for " << n_dims << "dimensions. Accepted dimensions are 2 and 3."<< endl;
+    cout << "Obstacle avoidance forcing term is set to 0" << endl;
+    obstacles_forcing_term = MatrixXd::Zero(n_time_steps,n_dims); 
+  } 
+  else
+  {
+    for(int t = 0; t < n_time_steps; t++)       // For each timestep
+    { 
+      for(int o_row = 0; o_row < n_rows_obstacles; o_row++) // For each obstacle
+      {
+        if(xds.norm() > 1e-5) // If velocity is greater than zero
+        {
+          // Current position vector [y_1, y_2, ... y_D]
+          current_position = xs.row(t);
+
+          // Obstacle position vector [y_obs_1, y_obs_2, ... y_obs_D]
+          obstacle_position = obstacles.row(o_row);
+
+          // Position to obstacle vector [y_obs_1 - y_1, y_obs_2 - y_2, ... , y_obs_D - y_D]
+          position_to_obstacle_vector = obstacle_position - current_position;
+          
+          // Velocity vector [yd_1, yd_2, ... , yd_D]
+          velocity_vector = xds.row(t);
+
+          resized_goal_pos = xs.row(n_time_steps-1);
+          resized_goal_pos.resizeLike(current_position);
+          if(position_to_obstacle_vector.norm() > ((resized_goal_pos- current_position).norm()))
+          { 
+            // We are closer to the goal than to the obstacle, therefore we don't need to avoid it anymore. 
+            obstacles_forcing_term.row(t) = VectorXd::Zero(1,n_dims);
+          }
+          else
+          {
+            // Rv is the result of rotating by pi/2 the normalized vector of (position_to_obstacle_vector) x (velocity_vector)
+
+            r = position_to_obstacle_vector.cross(velocity_vector);
+            r_norm = r / r.norm();
+
+            if(abs(r(0)) < 1e-3 && abs(r(1)) < 1e-3 && abs(r(2)) < 1e-3 ) //The obstacle is located in one of the points of the trajectory or the velocity is 0
+              obstacles_forcing_term.row(t) = VectorXd::Zero(1,n_dims);
+
+            else 
+            {
+              //The construction details of the rotational matrix R can be found here (point 6.2): http://inside.mines.edu/fs_home/gmurray/ArbitraryAxisRotation/
+
+              Rv(0,0) = ((current_position(0,0)*(pow(r_norm(0,1),2)+pow(r_norm(0,2),2)) -
+                        r_norm(0,0)*(current_position(0,1)*r_norm(0,1) + current_position(0,2)*r_norm(0,2) - 
+                        r_norm(0,0)*velocity_vector(0,0) - r_norm(0,1)*velocity_vector(0,1) - r_norm(0,2)*velocity_vector(0,2))))*(1-cos(PI/2)) + 
+                        (velocity_vector(0,0)*cos(PI/2)) +
+                        ((-current_position(0,2)*r_norm(0,1) + current_position(0,1)*r_norm(0,2) - r_norm(0,2)*velocity_vector(0,1) + r_norm(0,1)*velocity_vector(0,2)))
+                        *sin(PI/2);
+
+              Rv(0,1) = ((current_position(0,1)*(pow(r_norm(0,0),2)+pow(r_norm(0,2),2)) -
+                        r_norm(0,1)*(current_position(0,0)*r_norm(0,0) + current_position(0,2)*r_norm(0,2) - 
+                        r_norm(0,0)*velocity_vector(0,0) - r_norm(0,1)*velocity_vector(0,1) - r_norm(0,2)*velocity_vector(0,2))))*(1-cos(PI/2)) + 
+                        (velocity_vector(0,1)*cos(PI/2)) +
+                        ((current_position(0,2)*r_norm(0,0) + current_position(0,0)*r_norm(0,2) - r_norm(0,2)*velocity_vector(0,0) - r_norm(0,0)*velocity_vector(0,2)))
+                        *sin(PI/2);
+
+              Rv(0,2) = ((current_position(0,2)*(pow(r_norm(0,0),2)+pow(r_norm(0,1),2)) -
+                        r_norm(0,2)*(current_position(0,0)*r_norm(0,0) + current_position(0,1)*r_norm(0,1) - 
+                        r_norm(0,0)*velocity_vector(0,0) - r_norm(0,1)*velocity_vector(0,1) - r_norm(0,2)*velocity_vector(0,2))))*(1-cos(PI/2)) + 
+                        (velocity_vector(0,2)*cos(PI/2)) + 
+                        ((-current_position(0,1)*r_norm(0,0) + current_position(0,0)*r_norm(0,1) - r_norm(0,1)*velocity_vector(0,0) + r_norm(0,0)*velocity_vector(0,1)))*sin(PI/2);
+
+              phi = atan2((position_to_obstacle_vector.cross(velocity_vector)).norm(), position_to_obstacle_vector.dot(velocity_vector));
+              d_phi = gamma * phi * exp(-beta * abs(phi));
+
+              // p = R · v · d_phi
+              p = Rv*d_phi;
+              obstacles_forcing_term.row(t) = p.abs();
+            }
+          }
+        }
+        else 
+        {
+          obstacles_forcing_term.row(t) = VectorXd::Zero(1,n_dims);
+        }
+      }
+    }
+  }
+}
+
+// This function computes and adds the obstacle avoidance forcing term after the DMP has been trained, when the analytical solution is computed
+void Dmp::analyticalSolution(const Eigen::VectorXd& ts, Eigen::MatrixXd& xs, Eigen::MatrixXd& xds, Eigen::MatrixXd& forcing_terms, Eigen::MatrixXd& obstacles, Eigen::MatrixXd& obstacles_forcing_term, Eigen::MatrixXd& fa_outputs) const
+{
+  int n_time_steps = ts.size();
+  assert(n_time_steps>0);
+  
+  // Usually, we expect xs and xds to be of size T X dim(), so we resize to that. However, if the
+  // input matrices were of size dim() X T, we return the matrices of that size by doing a 
+  // transposeInPlace at the end. That way, the user can also request dim() X T sized matrices.
+  bool caller_expects_transposed = (xs.rows()==dim() && xs.cols()==n_time_steps);
+  
+  // INTEGRATE SYSTEMS ANALYTICALLY AS MUCH AS POSSIBLE
+
+  // Integrate phase
+  MatrixXd xs_phase;
+  MatrixXd xds_phase;
+  phase_system_->analyticalSolution(ts,xs_phase,xds_phase);
+  
+  // Compute gating term
+  MatrixXd xs_gating;
+  MatrixXd xds_gating;
+  gating_system_->analyticalSolution(ts,xs_gating,xds_gating);
+
+  // Compute the output of the function approximator
+  fa_outputs.resize(ts.size(),dim_orig());
+  fa_outputs.fill(0.0);
+  //if (isTrained())
+  computeFunctionApproximatorOutput(xs_phase, fa_outputs);
+
+  MatrixXd xs_gating_rep = xs_gating.replicate(1,fa_outputs.cols());
+  MatrixXd g_minus_y0_rep = (attractor_state()-initial_state()).transpose().replicate(n_time_steps,1);
+
+  avoidObstacles(ts, xs_phase, xds_phase, obstacles, obstacles_forcing_term);
+
+  // With g-y0 term and obstacle avoidance term
+  forcing_terms = (fa_outputs.array()*xs_gating_rep.array()*g_minus_y0_rep.array())+obstacles_forcing_term.array();
+  
+  MatrixXd xs_goal, xds_goal;
+  // Get current delayed goal
+  if (goal_system_==NULL)
+  {
+    // If there is no dynamical system for the delayed goal, the goal is
+    // simply the attractor state               
+    xs_goal  = attractor_state().transpose().replicate(n_time_steps,1);
+    // with zero change
+    xds_goal = MatrixXd::Zero(n_time_steps,dim_orig());
+  } 
+  else
+  {
+    // Integrate goal system and get current goal state
+    goal_system_->analyticalSolution(ts,xs_goal,xds_goal);
+  }
+
+  xs.resize(n_time_steps,dim());
+  xds.resize(n_time_steps,dim());
+
+  int T = n_time_steps;
+    
+  xs.GOALM(T) = xs_goal;     xds.GOALM(T) = xds_goal;
+  xs.PHASEM(T) = xs_phase;   xds.PHASEM(T) = xds_phase;
+  xs.GATINGM(T) = xs_gating; xds.GATINGM(T) = xds_gating;
+
+  // THE REST CANNOT BE DONE ANALYTICALLY
+  
+  // Reset the dynamical system, and get the first state
+  double damping = spring_system_->damping_coefficient();
+  SpringDamperSystem localspring_system_(tau(),initial_state(),attractor_state(),damping);
+  
+  // Set first attractor state
+  localspring_system_.set_attractor_state(xs_goal.row(0));
+  
+  // Start integrating spring damper system
+  int dim_spring = localspring_system_.dim();
+  VectorXd x_spring(dim_spring), xd_spring(dim_spring); // todo Why are these needed?
+  int t0 = 0;
+  localspring_system_.integrateStart(x_spring, xd_spring);
+  xs.row(t0).SPRING  = x_spring;
+  xds.row(t0).SPRING = xd_spring;
+
+  // Add forcing term to the acceleration of the spring state  
+  xds.SPRINGM_Z(1) = xds.SPRINGM_Z(1) + forcing_terms.row(t0)/tau();
+  
+  for (int tt=1; tt<n_time_steps; tt++)
+  {
+
+    double dt = ts[tt]-ts[tt-1];
+    
+    // Euler integration
+    xs.row(tt).SPRING  = xs.row(tt-1).SPRING + dt*xds.row(tt-1).SPRING;
+  
+    // Set the attractor state of the spring system
+    localspring_system_.set_attractor_state(xs.row(tt).GOAL);
+
+    // Integrate spring damper system
+    localspring_system_.differentialEquation(xs.row(tt).SPRING, xd_spring);
+    xds.row(tt).SPRING = xd_spring;
+    
+    // If necessary add a perturbation. May be useful for some off-line tests.
+    RowVectorXd perturbation = RowVectorXd::Constant(dim_orig(),0.0);
+    if (analytical_solution_perturber_!=NULL)
+      for (int i_dim=0; i_dim<dim_orig(); i_dim++)
+        // Sample perturbation from a normal Gaussian distribution
+        perturbation(i_dim) = (*analytical_solution_perturber_)();
+      
+    // Add forcing term to the acceleration of the spring state
+    xds.row(tt).SPRING_Z = xds.row(tt).SPRING_Z + forcing_terms.row(tt)/tau() + perturbation;
+    // Compute y component from z
+    xds.row(tt).SPRING_Y = xs.row(tt).SPRING_Z/tau();
+    
+  } 
+
+  if (caller_expects_transposed)
+  {
+    xs.transposeInPlace();
+    xds.transposeInPlace();
+  }
+}
+
+// This function is used to calculate the values of the forcing terms for each timestep with the inclusion of obstacles
+void Dmp::computeFunctionApproximatorInputsAndTargetsWithObstacles(const Trajectory& trajectory, VectorXd& fa_inputs_phase, MatrixXd& f_target, MatrixXd& obstacles_forcing_term) const
+{
+  int n_time_steps = trajectory.length();
+  double dim_data = trajectory.dim();
+  
+  if (dim_orig()!=dim_data)
+  {
+    cout << "WARNING: Cannot train " << dim_orig() << "-D DMP with " << dim_data << "-D data. Doing nothing." << endl;
+    return;
+  }
+  
+  // Integrate analytically to get goal, gating and phase states
+  MatrixXd xs_ana;
+  MatrixXd xds_ana;
+  
+  // Before, we would make clone of the dmp, and integrate it with the tau, and initial/attractor
+  // state of the trajectory. However, Thibaut needed to call this from outside the Dmp as well,
+  // with the tau/states of the this object. Therefore, we no longer clone. 
+  // Dmp* dmp_clone = static_cast<Dmp*>(this->clone());
+  // dmp_clone->set_tau(trajectory.duration());
+  // dmp_clone->set_initial_state(trajectory.initial_y());
+  // dmp_clone->set_attractor_state(trajectory.final_y());
+  // dmp_clone->analyticalSolution(trajectory.ts(),xs_ana,xds_ana);
+  analyticalSolution(trajectory.ts(),xs_ana,xds_ana);
+  MatrixXd xs_goal   = xs_ana.GOALM(n_time_steps);
+  MatrixXd xs_gating = xs_ana.GATINGM(n_time_steps);
+  MatrixXd xs_phase  = xs_ana.PHASEM(n_time_steps);
+  
+  fa_inputs_phase = xs_phase;
+  
+  // Get parameters from the spring-dampers system to compute inverse
+  double damping_coefficient = spring_system_->damping_coefficient();
+  double spring_constant     = spring_system_->spring_constant();
+  double mass                = spring_system_->mass();
+  if (mass!=1.0)
+  {
+    cout << "WARNING: Usually, spring-damper system of the DMP should have mass==1, but it is " << mass << endl;
+  }
+
+  // Compute inverse
+  // Obstacle avoidance term is added to the sum 
+  // TO DO: recheck the correctness of this sum!!
+  f_target = tau()*tau()*trajectory.ydds() + (spring_constant*(trajectory.ys()-xs_goal) + damping_coefficient*tau()*trajectory.yds())/mass + obstacles_forcing_term;
+  //cout << "f_target: " << f_target << endl;
+  
+  //Factor out gating term
+  for (unsigned int dd=0; dd<function_approximators_.size(); dd++)
+    f_target.col(dd) = f_target.col(dd).array()/xs_gating.array();
+ 
+}
+
+// This function trains the DMP taking into account a set of obstacles
+void Dmp::trainWithObstacles(const Trajectory& trajectory, std::string save_directory, MatrixXd& obstacles, MatrixXd& obstacles_forcing_term, bool overwrite)
+{
+  
+  // Set tau, initial_state and attractor_state from the trajectory 
+  set_tau(trajectory.duration());
+  set_initial_state(trajectory.initial_y());
+  set_attractor_state(trajectory.final_y());
+  
+  VectorXd fa_input_phase;
+  MatrixXd f_target;
+
+  // Function avoidObstacles is called to compute the values of the obstacle avoidance forcing terms
+  avoidObstacles(trajectory.ts(), trajectory.ys(), trajectory.yds(), obstacles, obstacles_forcing_term);
+
+  // Function computeFunctionApproximatorInputsAndTargetsWithObstacles is called to compute the values of the complete forcing terms 
+  computeFunctionApproximatorInputsAndTargetsWithObstacles(trajectory, fa_input_phase, f_target, obstacles_forcing_term);
+  
+  // Some checks before training function approximators
+  assert(!function_approximators_.empty());
+  
+  for (unsigned int dd=0; dd<function_approximators_.size(); dd++)
+  {
+    // This is just boring stuff to figure out if and where to store the results of training
+    string save_directory_dim;
+    if (!save_directory.empty())
+    {
+      if (function_approximators_.size()==1)
+        save_directory_dim = save_directory;
+      else
+        save_directory_dim = save_directory + "/dim" + to_string(dd);
+      
+      cout << "save_directory_dim = " << save_directory_dim << endl;
+    }
+    
+    // Actual training is happening here.
+    VectorXd fa_target = f_target.col(dd);
+    if (function_approximators_[dd]==NULL)
+    {
+      cerr << __FILE__ << ":" << __LINE__ << ":";
+      cerr << "WARNING: function approximator cannot be trained because it is NULL." << endl;
+    }
+    else
+    {
+      if (function_approximators_[dd]->isTrained())
+      {
+        cout << "HI THERE!! reTrain" << endl;
+        function_approximators_[dd]->reTrain(fa_input_phase,fa_target,save_directory_dim,overwrite);         
+      }
+      else
+      {
+        cout << "HI THERE!! 333333333" << endl;
+        function_approximators_[dd]->train(fa_input_phase,fa_target,save_directory_dim,overwrite);
+        cout << "HI THERE!! 444444444" << endl;
+      }
+    }
+  }
+}
+
+// End of SARA additions
+
+void Dmp::computeFunctionApproximatorInputsAndTargets(const Trajectory& trajectory, VectorXd& fa_inputs_phase, MatrixXd& f_target) const
+{
+  int n_time_steps = trajectory.length();
+  double dim_data = trajectory.dim();
+  
+  if (dim_orig()!=dim_data)
+  {
+    cout << "WARNING: Cannot train " << dim_orig() << "-D DMP with " << dim_data << "-D data. Doing nothing." << endl;
+    return;
+  }
+  
+  // Integrate analytically to get goal, gating and phase states
+  MatrixXd xs_ana;
+  MatrixXd xds_ana;
+  
+  // Before, we would make clone of the dmp, and integrate it with the tau, and initial/attractor
+  // state of the trajectory. However, Thibaut needed to call this from outside the Dmp as well,
+  // with the tau/states of the this object. Therefore, we no longer clone. 
+  // Dmp* dmp_clone = static_cast<Dmp*>(this->clone());
+  // dmp_clone->set_tau(trajectory.duration());
+  // dmp_clone->set_initial_state(trajectory.initial_y());
+  // dmp_clone->set_attractor_state(trajectory.final_y());
+  // dmp_clone->analyticalSolution(trajectory.ts(),xs_ana,xds_ana);
+  analyticalSolution(trajectory.ts(),xs_ana,xds_ana);
+  MatrixXd xs_goal   = xs_ana.GOALM(n_time_steps);
+  MatrixXd xs_gating = xs_ana.GATINGM(n_time_steps);
+  MatrixXd xs_phase  = xs_ana.PHASEM(n_time_steps);
+  
+  fa_inputs_phase = xs_phase;
+  
+  // Get parameters from the spring-dampers system to compute inverse
+  double damping_coefficient = spring_system_->damping_coefficient();
+  double spring_constant     = spring_system_->spring_constant();
+  double mass                = spring_system_->mass();
+  if (mass!=1.0)
+  {
+    cout << "WARNING: Usually, spring-damper system of the DMP should have mass==1, but it is " << mass << endl;
+  }
+
+  // Compute inverse
+  f_target = tau()*tau()*trajectory.ydds() + (spring_constant*(trajectory.ys()-xs_goal) + damping_coefficient*tau()*trajectory.yds())/mass;
+  
+  //Factor out gating term
+  for (unsigned int dd=0; dd<function_approximators_.size(); dd++)
+    f_target.col(dd) = f_target.col(dd).array()/xs_gating.array();
+ 
+}
+
+void Dmp::train(const Trajectory& trajectory)
+{
+  train(trajectory,"");
+}
+
+void Dmp::train(const Trajectory& trajectory, std::string save_directory, bool overwrite)
+{
+  
+  // Set tau, initial_state and attractor_state from the trajectory 
+  set_tau(trajectory.duration());
+  set_initial_state(trajectory.initial_y());
+  set_attractor_state(trajectory.final_y());
+  
+  VectorXd fa_input_phase;
+  MatrixXd f_target;
+  computeFunctionApproximatorInputsAndTargets(trajectory, fa_input_phase, f_target);
+  
+  // Some checks before training function approximators
+  assert(!function_approximators_.empty());
+  
+  for (unsigned int dd=0; dd<function_approximators_.size(); dd++)
+  {
+    // This is just boring stuff to figure out if and where to store the results of training
+    string save_directory_dim;
+    if (!save_directory.empty())
+    {
+      if (function_approximators_.size()==1)
+        save_directory_dim = save_directory;
+      else
+        save_directory_dim = save_directory + "/dim" + to_string(dd);
+    }
+    
+    // Actual training is happening here.
+    VectorXd fa_target = f_target.col(dd);
+    if (function_approximators_[dd]==NULL)
+    {
+      cerr << __FILE__ << ":" << __LINE__ << ":";
+      cerr << "WARNING: function approximator cannot be trained because it is NULL." << endl;
+    } 
+    else
+    {
+      if (function_approximators_[dd]->isTrained())
+        function_approximators_[dd]->reTrain(fa_input_phase,fa_target,save_directory_dim,overwrite);
+      else
+        function_approximators_[dd]->train(fa_input_phase,fa_target,save_directory_dim,overwrite);
+    }
+  }
+}
+
+void Dmp::getSelectableParameters(set<string>& selectable_values_labels) const {
+  assert(function_approximators_.size()>0);
+  for (int dd=0; dd<dim_orig(); dd++)
+  {
+    if (function_approximators_[dd]!=NULL)
+    {
+      if (function_approximators_[dd]->isTrained())
+      {
+        set<string> cur_labels;
+        function_approximators_[dd]->getSelectableParameters(cur_labels);
+        selectable_values_labels.insert(cur_labels.begin(), cur_labels.end());
+      }
+    }
+  }
+  selectable_values_labels.insert("goal");
+  
+  //cout << "selected_values_labels=["; 
+  //for (string label : selected_values_labels) 
+  //  cout << label << " ";
+  //cout << "]" << endl;
+  
+}
+
+void Dmp::setSelectedParameters(const set<string>& selected_values_labels)
+{
+  assert(function_approximators_.size()>0);
+  for (int dd=0; dd<dim_orig(); dd++)
+    if (function_approximators_[dd]!=NULL)
+      if (function_approximators_[dd]->isTrained())
+        function_approximators_[dd]->setSelectedParameters(selected_values_labels);
+
+  // Call superclass for initializations
+  Parameterizable::setSelectedParameters(selected_values_labels);
+
+  VectorXi lengths_per_dimension = VectorXi::Zero(dim_orig());
+  for (int dd=0; dd<dim_orig(); dd++)
+  {
+    if (function_approximators_[dd]!=NULL)
+      if (function_approximators_[dd]->isTrained())
+        lengths_per_dimension[dd] = function_approximators_[dd]->getParameterVectorSelectedSize();
+    
+    if (selected_values_labels.find("goal")!=selected_values_labels.end())
+      lengths_per_dimension[dd]++;
+  }
+  
+  setVectorLengthsPerDimension(lengths_per_dimension);
+      
+}
+
+void Dmp::getParameterVectorMask(const std::set<std::string> selected_values_labels, Eigen::VectorXi& selected_mask) const
+{
+  assert(function_approximators_.size()>0);
+  for (int dd=0; dd<dim_orig(); dd++)
+  {
+    assert(function_approximators_[dd]!=NULL);
+    assert(function_approximators_[dd]->isTrained());
+  }
+
+  selected_mask.resize(getParameterVectorAllSize());
+  selected_mask.fill(0);
+  
+  const int TMP_GOAL_NUMBER = -1;
+  int offset = 0;
+  VectorXi cur_mask;
+  for (int dd=0; dd<dim_orig(); dd++)
+  {
+    function_approximators_[dd]->getParameterVectorMask(selected_values_labels,cur_mask);
+
+    // This makes sure that the indices for each function approximator are different    
+    int mask_offset = selected_mask.maxCoeff(); 
+    for (int ii=0; ii<cur_mask.size(); ii++)
+      if (cur_mask[ii]!=0)
+        cur_mask[ii] += mask_offset;
+        
+    selected_mask.segment(offset,cur_mask.size()) = cur_mask;
+    offset += cur_mask.size();
+    
+    // Goal
+    if (selected_values_labels.find("goal")!=selected_values_labels.end())
+      selected_mask(offset) = TMP_GOAL_NUMBER;
+    offset++;
+    
+  }
+  assert(offset == getParameterVectorAllSize());
+  
+  // Replace TMP_GOAL_NUMBER with current max value
+  int goal_number = selected_mask.maxCoeff() + 1; 
+  for (int ii=0; ii<selected_mask.size(); ii++)
+    if (selected_mask[ii]==TMP_GOAL_NUMBER)
+      selected_mask[ii] = goal_number;
+    
+}
+
+int Dmp::getParameterVectorAllSize(void) const
+{
+  int total_size = 0;
+  for (unsigned int dd=0; dd<function_approximators_.size(); dd++)
+    total_size += function_approximators_[dd]->getParameterVectorAllSize();
+  
+  // For the goal
+  total_size += dim_orig();
+  return total_size;
+}
+
+
+void Dmp::getParameterVectorAll(VectorXd& values) const
+{
+  values.resize(getParameterVectorAllSize());
+  int offset = 0;
+  VectorXd cur_values;
+  VectorXd attractor = attractor_state();
+  for (int dd=0; dd<dim_orig(); dd++)
+  {
+    function_approximators_[dd]->getParameterVectorAll(cur_values);
+    values.segment(offset,cur_values.size()) = cur_values;
+    offset += cur_values.size();
+
+    values(offset) = attractor(dd);
+    offset++;
+  }
+}
+
+void Dmp::setParameterVectorAll(const VectorXd& values)
+{
+  assert(values.size()==getParameterVectorAllSize());
+  int offset = 0;
+  VectorXd cur_values;
+  VectorXd attractor(dim_orig());
+  for (int dd=0; dd<dim_orig(); dd++)
+  {
+    int n_parameters_required = function_approximators_[dd]->getParameterVectorAllSize();
+    cur_values = values.segment(offset,n_parameters_required);
+    function_approximators_[dd]->setParameterVectorAll(cur_values);
+    offset += n_parameters_required;
+    
+    attractor(dd) = values(offset);
+    offset += 1;
+  }
+  
+  // Set the goal
+  set_attractor_state(attractor); 
+}
+
+
+
+void Dmp::set_tau(double tau) {
+  DynamicalSystem::set_tau(tau);
+
+  // Set value in all relevant subsystems also  
+  spring_system_->set_tau(tau);
+  if (goal_system_!=NULL)
+    goal_system_->set_tau(tau);
+  phase_system_ ->set_tau(tau);
+  gating_system_->set_tau(tau);
+}
+
+void Dmp::set_initial_state(const VectorXd& y_init) {
+  DynamicalSystem::set_initial_state(y_init);
+  
+  // Set value in all relevant subsystems also  
+  spring_system_->set_initial_state(y_init);
+  if (goal_system_!=NULL)
+    goal_system_->set_initial_state(y_init);
+}    
+
+void Dmp::set_attractor_state(const VectorXd& y_attr) {
+  DynamicalSystem::set_attractor_state(y_attr);
+  
+  // Set value in all relevant subsystems also  
+  if (goal_system_!=NULL)
+    goal_system_->set_attractor_state(y_attr);
+
+  // Do NOT do the following. The attractor state of the spring system is determined by the goal 
+  // system
+  // spring_system_->set_attractor_state(y_attr);
+
+}    
+
+
+string Dmp::toString(void) const
+{
+  RETURN_STRING_FROM_BOOST_SERIALIZATION_XML("Dmp");
+}
+
+
+template<class Archive>
+void Dmp::serialize(Archive & ar, const unsigned int version)
+{
+  // serialize base class information
+  ar & BOOST_SERIALIZATION_BASE_OBJECT_NVP(DynamicalSystem);
+  ar & BOOST_SERIALIZATION_BASE_OBJECT_NVP(Parameterizable);
+  
+  ar & BOOST_SERIALIZATION_NVP(goal_system_);
+  ar & BOOST_SERIALIZATION_NVP(spring_system_);
+  ar & BOOST_SERIALIZATION_NVP(phase_system_);
+  ar & BOOST_SERIALIZATION_NVP(gating_system_);
+  ar & BOOST_SERIALIZATION_NVP(function_approximators_);
+}
+
+}

@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<launch>
+<!--	<include file="$(find qualisys)/launch/qualisys.launch"/>  -->
+	<!-- #### LAUNCH PARAMETERS ### -->
+	<!-- in case you have different robot configurations -->
+	<param name="use_sim_time" value="false" />
+	<arg name="robot_name" default="standing2"/>
+	<arg name="urdf_name" default="standing2"/>
+ 
+	<!-- ### Load the description of the robot ###  -->
+	<param name="robot_description" command="$(find xacro)/xacro --inorder $(find hrc_cobot_description)/model/$(arg urdf_name).xacro"/>
+
+	<!-- ### Run the kinematic node ###  -->
+	<node pkg="dmp_bbo_node" type="dmp_ros_ctl_ik" name="dmp_bbo_node" output="screen"/>
+</launch>
